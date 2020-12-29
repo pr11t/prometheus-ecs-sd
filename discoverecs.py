@@ -1,6 +1,7 @@
 from __future__ import print_function
 from collections import defaultdict
 import boto3
+import botocore
 import json
 import argparse
 import time
@@ -122,6 +123,23 @@ class TaskInfoDiscoverer:
         self.task_definition_cache = FlipCache()
         self.container_instance_cache = FlipCache()
         self.ec2_instance_cache = FlipCache()
+
+    def assume_role(self, role):
+        try:
+            sts_client = boto3.client('sts')
+            response = sts_client.assume_role(RoleArn=role, RoleSessionName='prometheus-ecs-sd')
+            creds = response['Credentials']
+            assumed_session = boto3.Session(
+                aws_access_key_id=creds['AccessKeyId'],
+                aws_secret_access_key=creds['SecretAccessKey'],
+                aws_session_token=creds['SessionToken'])
+            self.ec2_client = assumed_session.client('ec2')
+            self.ecs_client = assumed_session.client('ecs')
+            return True
+        except botocore.exceptions.ClientError as exception:
+            if exception.response['Error']['Code'] == 'AccessDenied':
+                log(exception)
+                return False
 
     def flip_caches(self):
         self.task_cache.flip()
@@ -276,7 +294,12 @@ class TaskInfoDiscoverer:
             )
         )
 
-    def get_infos(self):
+    def get_infos(self, role=None):
+        if role:
+            role_assumed = self.assume_role(role)
+            if not role_assumed:
+                return []
+
         self.flip_caches()
         task_infos = []
         fargate_task_infos = []
@@ -298,6 +321,7 @@ class Target:
         port,
         metrics_path,
         p_instance,
+        tags,
         ecs_task_id,
         ecs_task_name,
         ecs_task_version,
@@ -309,6 +333,7 @@ class Target:
         self.port = port
         self.metrics_path = metrics_path
         self.p_instance = p_instance
+        self.tags = tags
         self.ecs_task_id = ecs_task_id
         self.ecs_task_name = ecs_task_name
         self.ecs_task_version = ecs_task_version
@@ -357,6 +382,31 @@ def task_info_to_targets(task_info):
 
     if not task_info.valid():
         return targets
+    for container_definition in task_info.task_definition['containerDefinitions']:
+        prometheus = get_environment_var(container_definition['environment'], 'PROMETHEUS')
+        metrics_path = get_environment_var(container_definition['environment'], 'PROMETHEUS_ENDPOINT')
+        nolabels = get_environment_var(container_definition['environment'], 'PROMETHEUS_NOLABELS')
+        prom_port = get_environment_var(container_definition['environment'], 'PROMETHEUS_PORT')
+        prom_tags = get_environment_var(container_definition['environment'], 'PROMETHEUS_TAGS')
+        prom_container_port = get_environment_var(container_definition['environment'], 'PROMETHEUS_CONTAINER_PORT')
+        if nolabels != 'true': nolabels = None
+        containers = filter(lambda c:c['name'] == container_definition['name'], task_info.task['containers'])
+        if prometheus:
+            for container in containers:
+                ecs_task_name=extract_name(task_info.task['taskDefinitionArn'])
+                has_host_port_mapping = 'portMappings' in container_definition and len(container_definition['portMappings']) > 0
+                if prom_port:
+                    first_port = prom_port
+                elif task_info.task_definition.get('networkMode') in ('host', 'awsvpc'):
+                     if has_host_port_mapping:
+                         first_port = str(container_definition['portMappings'][0]['hostPort'])
+                     else:
+                         first_port = '80'
+                elif prom_container_port:
+                    binding_by_container_port = filter(lambda c:str(c['containerPort']) == prom_container_port, container['networkBindings'])
+                    first_port = str(binding_by_container_port[0]['hostPort'])
+                else:
+                    first_port = str(container['networkBindings'][0]['hostPort'])
 
     for container_definition in task_definition["containerDefinitions"]:
         prometheus_enabled = get_environment_var(
@@ -445,6 +495,7 @@ def task_info_to_targets(task_info):
                     port=first_port,
                     metrics_path=metrics_path,
                     p_instance=p_instance,
+                    tags=prom_tags,
                     ecs_task_id=ecs_task_id,
                     ecs_task_name=ecs_task_name,
                     ecs_task_version=ecs_task_version,
@@ -457,9 +508,10 @@ def task_info_to_targets(task_info):
 
 
 class Main:
-    def __init__(self, directory, interval):
+    def __init__(self, directory, interval, roles):
         self.directory = directory
         self.interval = interval
+        self.roles = roles
         self.discoverer = TaskInfoDiscoverer()
 
     def write_jobs(self, jobs):
@@ -472,7 +524,14 @@ class Main:
 
     def get_targets(self):
         targets = []
-        infos = self.discoverer.get_infos()
+
+        if not self.roles:
+            infos = self.discoverer.get_infos()
+        elif isinstance(self.roles, list):
+            infos = []
+            for role in self.roles:
+                infos += self.discoverer.get_infos(role)
+
         for info in infos:
             targets += task_info_to_targets(info)
         return targets
@@ -506,6 +565,7 @@ class Main:
                     "labels": {
                         "instance": target.p_instance,
                         "job": target.ecs_task_name,
+                        "tags" : target.tags,
                         "metrics_path": path,
                     },
                 }
@@ -525,6 +585,7 @@ def main():
     arg_parser = argparse.ArgumentParser()
     arg_parser.add_argument("--directory", required=True)
     arg_parser.add_argument("--interval", default=60)
+    arg_parser.add_argument("--roles", nargs='*', default=None)
     args = arg_parser.parse_args()
     log(
         "Starting. Directory: "
@@ -533,7 +594,7 @@ def main():
         + str(args.interval)
         + "s."
     )
-    Main(args.directory, float(args.interval)).loop()
+    Main(args.directory, float(args.interval), args.roles).loop()
 
 
 if __name__ == "__main__":
